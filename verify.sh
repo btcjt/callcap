@@ -86,8 +86,9 @@ report() { # <label> <wav> <hint>
 }
 
 far_ok=0; near_ok=0
+SOURCE_LABEL="$([[ "$SYSTEM" -eq 1 || -z "$APP" ]] && echo "something" || echo "$APP")"
 report "far end (them)" "$SESSION/far.wav" \
-  "check Screen Recording permission, and that $APP was actually playing audio" || far_ok=1
+  "check Screen Recording permission, and that $SOURCE_LABEL was actually playing audio" || far_ok=1
 report "near end (you)" "$SESSION/near.wav" \
   "check Microphone permission and the selected input device" || near_ok=1
 
