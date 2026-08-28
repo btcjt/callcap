@@ -1,0 +1,3 @@
+# Nothing generated lives here, but keep stray build output and macOS cruft out.
+.DS_Store
+*.dSYM/

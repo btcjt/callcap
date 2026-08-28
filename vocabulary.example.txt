@@ -1,0 +1,7 @@
+# Words whisper should expect: jargon, product names, people, acronyms.
+# Fed to whisper as an initial prompt, so proper nouns and domain terms come
+# out spelled correctly instead of phonetically. Keep it to a few lines —
+# it competes with the audio for context.
+#
+# Add the names that actually come up on your calls, and revisit it whenever
+# something transcribes wrong twice.
