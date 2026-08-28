@@ -15,8 +15,18 @@ FAR_TEXT="The quarterly inventory reconciliation finished ahead of schedule this
 NEAR_TEXT="Good, then the only thing outstanding is the vendor handover next week."
 
 echo "==> synthesising two channels"
-say -v Samantha -o "$WORK/far.aiff"  "$FAR_TEXT"
-say -v Daniel   -o "$WORK/near.aiff" "$NEAR_TEXT"
+say -v Samantha -o "$WORK/far_speech.aiff"  "$FAR_TEXT"
+say -v Daniel   -o "$WORK/near_speech.aiff" "$NEAR_TEXT"
+
+# Pad each channel with a minute of silence. This is what a real call looks
+# like per-channel — mostly quiet while the other person talks — and it is the
+# condition under which whisper invents fluent speech and then repeats it.
+# A fixture without silence cannot catch that.
+ffmpeg -nostdin -v error -y -f lavfi -i anullsrc=r=22050:cl=mono -t 30 "$WORK/sil.wav"
+for ch in far near; do
+  ffmpeg -nostdin -v error -y -i "$WORK/sil.wav" -i "$WORK/${ch}_speech.aiff" -i "$WORK/sil.wav" \
+    -filter_complex "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]" -map "[a]" "$WORK/$ch.aiff"
+done
 # Shaped like real recorder output: far is 48k stereo float, near 48k mono float.
 ffmpeg -nostdin -v error -y -i "$WORK/far.aiff"  -ar 48000 -ac 2 -c:a pcm_f32le "$WORK/far.wav"
 ffmpeg -nostdin -v error -y -i "$WORK/near.aiff" -ar 48000 -ac 1 -c:a pcm_f32le "$WORK/near.wav"
@@ -90,6 +100,25 @@ LOUD="$(audio_levels "$WORK/loud.wav")"
 ! audio_is_silent "${LOUD%%|*}"; check "speech is not reported as silent" $?
 audio_is_silent "$(audio_levels "$WORK/quiet.wav" | cut -d'|' -f1)"
 check "true silence is reported as silent" $?
+
+# Whisper hallucinates over silence and then carries the invention forward as
+# context until it fills the transcript. A real 34-minute call came back 97%
+# fabricated this way, with plausible-looking stats. Guarded by VAD plus
+# -mc 0 in transcribe.sh; this asserts the guard is still in place.
+python3 - "$WORK/transcript.json" <<'ASSERT'
+import collections, json, sys
+turns = json.load(open(sys.argv[1]))["turns"]
+sentences = collections.Counter()
+for turn in turns:
+    for sentence in turn["text"].replace("?", ".").replace("!", ".").split("."):
+        sentence = sentence.strip().lower()
+        if len(sentence.split()) >= 4:
+            sentences[sentence] += 1
+worst = max(sentences.values(), default=0)
+assert worst <= 2, f"repetition loop: a sentence appears {worst}x — {sentences.most_common(1)}"
+assert len(turns) <= 8, f"{len(turns)} turns from two short utterances suggests runaway output"
+ASSERT
+check "no hallucination loop over silence" $?
 
 echo
 if [[ "$fail" -eq 0 ]]; then echo "PASS"; else echo "FAIL"; exit 1; fi

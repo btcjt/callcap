@@ -58,9 +58,32 @@ FAR="$SESSION/far.wav"
 NEAR="$SESSION/near.wav"
 META="$SESSION/recording.json"
 
+# Transcription settings improve; recordings do not come back. When the raw
+# WAVs have already been cleaned up, recover both channels from the stereo
+# archive (left = far, right = near) so an old call can be re-transcribed.
+FROM_ARCHIVE=0
+if [[ ! -f "$FAR" || ! -f "$NEAR" ]]; then
+  if [[ -f "$SESSION/call.m4a" ]]; then
+    echo "==> raw audio already cleaned up; re-reading channels from call.m4a"
+    ffmpeg -nostdin -v error -y -i "$SESSION/call.m4a" \
+      -filter_complex "[0:a]channelsplit=channel_layout=stereo[l][r]" \
+      -map "[l]" -ar 16000 -c:a pcm_s16le "$SESSION/.far_src.wav" \
+      -map "[r]" -ar 16000 -c:a pcm_s16le "$SESSION/.near_src.wav"
+    FAR="$SESSION/.far_src.wav"
+    NEAR="$SESSION/.near_src.wav"
+    FROM_ARCHIVE=1
+  else
+    echo "no audio in $SESSION (need far.wav + near.wav, or call.m4a)" >&2
+    exit 1
+  fi
+fi
+
 # The recorder measures how much later the mic stream started than the app
 # stream. Pad the late one so both tracks share a t=0.
 OFFSET="$(jq -r '.nearOffsetSeconds // 0' "$META" 2>/dev/null || echo 0)"
+# The archive was written from already-aligned tracks; re-padding would shift
+# the mic channel a second time.
+[[ "$FROM_ARCHIVE" -eq 1 ]] && OFFSET=0
 NEAR_PAD_MS=0
 FAR_PAD_MS=0
 if (( $(echo "$OFFSET > 0" | bc -l) )); then
@@ -98,12 +121,26 @@ echo "==> preparing audio"
 
 PROMPT_FILE="$CALLCAP_VOCABULARY"
 PROMPT_ARGS=()
-[[ -f "$PROMPT_FILE" ]] && PROMPT_ARGS=(--prompt "$(tr '\n' ' ' < "$PROMPT_FILE")")
+if [[ -f "$PROMPT_FILE" ]]; then
+  # Strip comments and blank lines: the prompt is fed to whisper as literal
+  # prior context, so '# Words whisper should expect' would be treated as
+  # vocabulary rather than as a note to the reader.
+  PROMPT_TEXT="$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$PROMPT_FILE" | tr '\n' ' ')"
+  [[ -n "${PROMPT_TEXT// /}" ]] && PROMPT_ARGS=(--prompt "$PROMPT_TEXT")
+fi
 
 run_whisper() { # <wav> <out-prefix> <who>
   echo "==> transcribing $3"
+  # --vad: a channel is mostly silence while the other party talks, and
+  #   whisper invents fluent speech over silence.
+  # -mc 0: no text context between windows, so an invented phrase cannot seed
+  #   the next window and run away. (Measured on a real 34-minute call: without
+  #   these, 97% of one channel was a single hallucinated sentence repeated.)
+  # No -nf: temperature fallback is what lets the decoder escape a repetition
+  #   loop; disabling it for speed is what let one take over the transcript.
   "$WHISPER" -m "$MODEL" -f "$1" -of "$2" -oj -l "$CALLCAP_LANGUAGE" -t "$THREADS" \
-    -np -nf "${PROMPT_ARGS[@]}" >/dev/null 2>"$SESSION/.whisper.log" \
+    -np -mc 0 --vad --vad-model "$CALLCAP_VAD_MODEL" \
+    "${PROMPT_ARGS[@]}" >/dev/null 2>"$SESSION/.whisper.log" \
     || { echo "whisper failed for $3; see $SESSION/.whisper.log" >&2; exit 1; }
 }
 
@@ -116,6 +153,15 @@ python3 "$HERE/merge_transcript.py" \
   --them "$THEM" --me "$ME" \
   --meta "$META" \
   --out-md "$SESSION/transcript.md" --out-json "$SESSION/transcript.json"
+
+if [[ "$FROM_ARCHIVE" -eq 1 ]]; then
+  rm -f "$SESSION"/.far_src.wav "$SESSION"/.near_src.wav \
+        "$SESSION"/.far16.wav "$SESSION"/.near16.wav \
+        "$SESSION"/.far.json "$SESSION"/.near.json "$SESSION"/.whisper.log
+  echo
+  echo "==> transcript: $SESSION/transcript.md (call.m4a left as-is)"
+  exit 0
+fi
 
 echo "==> archiving audio"
 # join truncates to its shortest input, which would silently clip the archive

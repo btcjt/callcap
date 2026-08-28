@@ -21,6 +21,8 @@ Requires macOS 13+, Xcode command line tools, and:
 brew install whisper-cpp ffmpeg jq
 curl -L --create-dirs -o ~/.cache/whisper-cpp/ggml-large-v3.bin \
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin
+curl -L --create-dirs -o ~/.cache/whisper-cpp/ggml-silero-v5.1.2.bin \
+  https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
 
 ./setup-signing-identity.sh   # once per machine
 ./build.sh                    # after any source change
@@ -48,13 +50,17 @@ callcap-transcribe latest --them "Sam"        # transcribe an earlier recording
 Ctrl-C stops the recording; transcription then runs automatically (~9× realtime
 per channel, so a 30-minute call takes about 7 minutes for both).
 
+`callcap-transcribe` works on an old call even after its raw audio has been
+cleaned up — it recovers both channels from `call.m4a`. Transcription settings
+improve; recordings do not come back.
+
 Output lands in one directory per call:
 
 | File | What |
 | ---- | ---- |
 | `transcript.md` | speaker-labelled, timestamped — the thing you feed an LLM |
 | `transcript.json` | same content structured, plus the speaking-time split |
-| `call.m4a` | stereo archive, **left = far end, right = you** |
+| `call.m4a` | stereo archive, **left = far end, right = you** — also the input for re-transcribing later |
 | `recording.json` | capture metadata + the inter-stream clock offset |
 
 Capturing **all system audio is the default** because it works without knowing
@@ -180,9 +186,21 @@ Most of these cost real debugging time; they are recorded so they cost it once.
 - **Whisper snaps its first segment to `t=0`** regardless of leading silence,
   so `nearOffsetSeconds` shifts the audio but is not visible in the transcript's
   first timestamp.
-- **Whisper hallucinates on silence** — "Thank you." and similar appear in long
-  quiet stretches, which your own channel has plenty of while the other person
-  talks. whisper.cpp's `--vad` largely fixes it and is not yet wired up.
+- **Whisper invents fluent speech over silence, then repeats it forever.** This
+  is the single worst failure this tool can have, because the output looks
+  entirely plausible — a real 34-minute call came back with one channel 97%
+  filled by a single hallucinated sentence repeated 980 times, reporting a
+  confident 14,822 words. A per-channel recording is *mostly* silence (the
+  other person is talking), so the exposure is structural, and two settings
+  made it catastrophic rather than occasional:
+  `-nf` disabled the temperature fallback that lets the decoder escape a
+  repetition loop, and whisper's default context carry-over fed each invented
+  phrase back in as the next window's prompt, so a loop that started once never
+  ended. Fixed by running with **VAD** (silence never reaches the decoder),
+  **`-mc 0`** (no context carry-over between windows) and no `-nf`. Verified
+  against that call: 97% loops → 0%, and the recovered word count matched the
+  measured speech duration almost exactly. `selftest.sh` guards it with a
+  fixture that is mostly silence — a fixture without silence cannot catch this.
 - **The far end leaks into your room mic**, so a sentence can transcribe on both
   channels. `merge_transcript.py` drops the duplicate; the heuristic is text
   identity within a 1s window, so it is conservative and lets echoes through

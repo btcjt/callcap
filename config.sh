@@ -30,6 +30,12 @@ CALLCAP_LANGUAGE="${CALLCAP_LANGUAGE:-en}"
 # owned: the tool ships an example, never a vocabulary of its own.
 CALLCAP_VOCABULARY="${CALLCAP_VOCABULARY:-$CALLCAP_CONFIG_DIR/vocabulary.txt}"
 
+# Voice activity detection. Not optional in practice: a call channel is mostly
+# silence while the other person talks, and whisper hallucinates fluent text
+# over silence — then carries the hallucination forward as context until it
+# fills the whole transcript. VAD stops silence reaching the decoder at all.
+CALLCAP_VAD_MODEL="${CALLCAP_VAD_MODEL:-$HOME/.cache/whisper-cpp/ggml-silero-v5.1.2.bin}"
+
 # Auto-stop, in minutes; 0 disables. Overridden per-run by flags.
 CALLCAP_SILENCE_TIMEOUT="${CALLCAP_SILENCE_TIMEOUT:-5}"
 CALLCAP_MAX_DURATION="${CALLCAP_MAX_DURATION:-180}"
@@ -52,5 +58,11 @@ callcap_require() {
   }
   command -v ffmpeg >/dev/null || { echo "ffmpeg not found — brew install ffmpeg" >&2; missing=1; }
   command -v jq >/dev/null || { echo "jq not found — brew install jq" >&2; missing=1; }
+  [[ -f "$CALLCAP_VAD_MODEL" ]] || {
+    echo "VAD model not found at $CALLCAP_VAD_MODEL" >&2
+    echo "  curl -L --create-dirs -o \"$CALLCAP_VAD_MODEL\" \\" >&2
+    echo "    https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin" >&2
+    missing=1
+  }
   return $missing
 }
