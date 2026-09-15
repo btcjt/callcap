@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import re
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -121,10 +122,24 @@ def main() -> None:
 
     duration = max((t.end for t in turns), default=0.0)
     words = sum(len(t.text.split()) for t in turns)
+    # Both parties always appear, even at zero: a side with no speech is the
+    # headline fact of the transcript, not an omission from a dict.
     by_speaker = {
         name: round(sum(t.end - t.start for t in turns if t.speaker == name), 1)
-        for name in {t.speaker for t in turns}
+        for name in (args.them, args.me)
     }
+    warnings = []
+    if turns and by_speaker[args.me] == 0:
+        warnings.append(
+            f"no speech on the microphone channel — {args.me}'s side was not recorded "
+            f"(silent input?). Any of {args.me}'s words below reached the far channel as "
+            f"echo and are attributed to {args.them}."
+        )
+    if turns and by_speaker[args.them] == 0:
+        warnings.append(
+            f"no speech on the app-audio channel — {args.them}'s side was not recorded "
+            f"(wrong --app target, or Screen Recording permission?)."
+        )
 
     args.out_json.write_text(
         json.dumps(
@@ -135,6 +150,7 @@ def main() -> None:
                 "durationSeconds": round(duration, 1),
                 "wordCount": words,
                 "speakingSeconds": by_speaker,
+                "warnings": warnings,
                 "turns": [asdict(t) for t in turns],
             },
             indent=2,
@@ -149,6 +165,7 @@ def main() -> None:
         f"- Speakers: {args.them} (far end), {args.me} (microphone)",
         f"- Speaking time: " + ", ".join(f"{k} {clock(v)}" for k, v in sorted(by_speaker.items())),
         f"- Words: {words}",
+        *[f"- **Warning:** {w}" for w in warnings],
         "",
         "---",
         "",
@@ -159,6 +176,8 @@ def main() -> None:
 
     args.out_md.write_text("\n".join(lines))
     print(f"    {len(turns)} turns, {words} words, {clock(duration)}")
+    for w in warnings:
+        print(f"    warning: {w}", file=sys.stderr)
 
 
 if __name__ == "__main__":

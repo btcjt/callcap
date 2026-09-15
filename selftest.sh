@@ -34,13 +34,31 @@ rm -f "$WORK"/*.aiff
 
 NEAR_RAW_SECS="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$WORK/near.wav")"
 
+# Second session: same far end, but the microphone track is silence for its
+# whole length — what a named input with nothing on it produces. A real
+# 55-minute call did exactly that (--mic matched a USB interface the call app
+# was not using): near.wav was full-length at -63 dBFS, the frame-count check
+# passed, and the transcript credited every word to the far end.
+SILENT="$(dirname "$WORK")/call_silentmic"
+mkdir -p "$SILENT"
+cp "$WORK/far.wav" "$SILENT/far.wav"
+ffmpeg -nostdin -v error -y -f lavfi -i anullsrc=r=48000:cl=mono -t "$NEAR_RAW_SECS" \
+  -c:a pcm_f32le "$SILENT/near.wav"
+
 cat > "$WORK/recording.json" <<JSON
 { "session": "call_selftest", "recordedAt": "2026-01-01T00:00:00Z",
   "app": "selftest", "nearOffsetSeconds": 3.0 }
 JSON
 
+cat > "$SILENT/recording.json" <<JSON
+{ "session": "call_silentmic", "recordedAt": "2026-01-01T00:00:00Z",
+  "app": "selftest", "nearOffsetSeconds": 0 }
+JSON
+
 echo "==> running transcribe.sh"
 "$HERE/transcribe.sh" "$WORK" --me "Near" --them "Far" >/dev/null
+echo "==> running transcribe.sh with a silent microphone track"
+"$HERE/transcribe.sh" "$SILENT" --me "Near" --them "Far" >/dev/null 2>"$SILENT/.stderr"
 
 fail=0
 check() { # <description> <condition-already-evaluated:0|1>
@@ -100,6 +118,30 @@ LOUD="$(audio_levels "$WORK/loud.wav")"
 ! audio_is_silent "${LOUD%%|*}"; check "speech is not reported as silent" $?
 audio_is_silent "$(audio_levels "$WORK/quiet.wav" | cut -d'|' -f1)"
 check "true silence is reported as silent" $?
+
+# The pre-transcribe gate in call.sh: a silent channel must be called out
+# before whisper runs, a live one must pass without noise.
+# (set -e: a bare failing call would end the script here, so test through `!`.)
+! warn_if_silent "near end" "$WORK/quiet.wav" "hint" 2>/dev/null
+check "silent channel trips the pre-transcribe warning" $?
+warn_if_silent "near end" "$WORK/loud.wav" "hint" 2>/dev/null
+check "live channel passes the pre-transcribe check" $?
+
+# And the transcript itself must say a side is missing rather than presenting
+# the far end as the whole conversation.
+grep -q "Warning:.*no speech on the microphone channel" "$SILENT/transcript.md"
+check "silent mic is stated in the transcript header" $?
+grep -q "no speech on the microphone channel" "$SILENT/.stderr"
+check "silent mic is reported on stderr at merge time" $?
+python3 - "$SILENT/transcript.json" <<'ASSERT'
+import json, sys
+data = json.load(open(sys.argv[1]))
+assert data["speakingSeconds"]["Near"] == 0, data["speakingSeconds"]
+assert data["speakingSeconds"]["Far"] > 0, data["speakingSeconds"]
+assert data["warnings"], "warnings list empty"
+assert all(t["speaker"] == "Far" for t in data["turns"]), "silent mic produced Near turns"
+ASSERT
+check "speaking time lists the silent side at zero" $?
 
 # Whisper hallucinates over silence and then carries the invention forward as
 # context until it fills the transcript. A real 34-minute call came back 97%

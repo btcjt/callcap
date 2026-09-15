@@ -73,6 +73,18 @@ SESSION="$(caffeinate -i "$CALLCAP_BIN" "${REC_ARGS[@]}" \
       2> >(grep -v "AVCaptureDeviceTypeExternal\|NSCameraUseContinuityCameraDeviceType" >&2))"
 [[ -n "$SESSION" && -d "$SESSION" ]] || { echo "recording failed" >&2; exit 1; }
 
+# A channel can be full-length and still empty: an input with no signal writes
+# frames all call long. Say so here, while it is obvious which call this was —
+# a transcript with one silent side reads as if the other person simply talked
+# the whole time. Transcription still runs; the other side is worth keeping.
+# shellcheck source=levels.sh
+source "$HERE/levels.sh"
+echo
+warn_if_silent "near end (you)" "$SESSION/near.wav" \
+  "microphone '${MIC:-system default input}' carried no signal, so only the far end can be transcribed. Check the call app uses that same input, or drop --mic / CALLCAP_MIC for the system default. Run callcap-check before the next call." || true
+warn_if_silent "far end (them)" "$SESSION/far.wav" \
+  "app audio carried no signal. Check the --app target and Screen Recording permission." || true
+
 if [[ "$TRANSCRIBE" -eq 1 ]]; then
   echo
   # Restore default handling so a second Ctrl-C can abort transcription; the

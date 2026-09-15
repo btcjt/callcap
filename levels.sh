@@ -20,3 +20,19 @@ audio_is_silent() {
   [[ -z "$mean" ]] && return 0
   (( $(echo "$mean < -60" | bc -l) ))
 }
+
+# warn_if_silent <label> <wav> <hint> -> 0 when the file carries audio;
+# otherwise prints a warning on stderr and returns 1 (missing file or silent)
+warn_if_silent() {
+  local mean
+  if [[ ! -f "$2" ]]; then
+    echo "warning: $1: no audio file — $3" >&2
+    return 1
+  fi
+  mean="$(audio_levels "$2" | cut -d'|' -f1)"
+  if audio_is_silent "$mean"; then
+    echo "warning: $1 is SILENT (mean ${mean:-unreadable}) — $3" >&2
+    return 1
+  fi
+  return 0
+}

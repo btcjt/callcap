@@ -119,7 +119,8 @@ callcap-rec --remove-aggregate "Multi-Output Device"
 - **Raw audio is bulky while recording** — roughly 1.75 GB/hour across both
   channels — until transcription replaces it with a ~28 MB/hour `call.m4a`.
 - **Nothing recovers audio nobody captured.** `callcap-check` before a call
-  that matters is the cheap insurance.
+  that matters is the cheap insurance — and the only proof that a `--mic`
+  device is the one you actually speak into.
 - **Recording other people is your responsibility.** Tell them; some
   jurisdictions require it.
 
@@ -201,6 +202,16 @@ Most of these cost real debugging time; they are recorded so they cost it once.
   against that call: 97% loops → 0%, and the recovered word count matched the
   measured speech duration almost exactly. `selftest.sh` guards it with a
   fixture that is mostly silence — a fixture without silence cannot catch this.
+- **A full-length microphone track can still be empty.** `--mic "USB audio"`
+  matched a USB interface by name while the call app was using the built-in
+  mic; the interface had nothing on its input, so `near.wav` ran the whole
+  55-minute call at -63 dBFS, the frame-count warning never fired, and the
+  transcript credited every word — including the echo of my own voice off the
+  other party's speakers — to them, as one 4,500-word turn. Levels are now
+  tracked per channel: the recorder warns after a minute with no signal on the
+  mic (in time to restart), again at stop, `recording.json` records the device
+  and peak levels, `callcap` says which channel is silent before whisper runs,
+  and the transcript header states when a side has no speech.
 - **The far end leaks into your room mic**, so a sentence can transcribe on both
   channels. `merge_transcript.py` drops the duplicate; the heuristic is text
   identity within a 1s window, so it is conservative and lets echoes through

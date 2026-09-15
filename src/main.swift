@@ -242,6 +242,19 @@ final class CallRecorder: NSObject, SCStreamOutput, SCStreamDelegate,
     private let soundThresholdDB: Float = -45
     private var nearFrames: Int64 = 0
 
+    /// Loudest buffer RMS seen on each channel, in dBFS. A channel can deliver
+    /// frames for the whole call and still carry nothing — an interface with
+    /// nothing plugged into it, a muted headset — so frame counts alone cannot
+    /// say whether anyone was actually recorded. +inf means the level could
+    /// not be read (non-float samples), which is treated as "fine".
+    private var farPeakDB: Float = -.infinity
+    private var nearPeakDB: Float = -.infinity
+    /// Below this a channel is treated as carrying no signal at all. Room tone
+    /// on a live microphone sits around -50 dBFS; a dead input reads -60 and
+    /// lower for the whole call.
+    private let deadChannelDB: Float = -55
+    private var micName = "system default input"
+
     private let writeQueue = DispatchQueue(label: "com.callcap.write")
     private var finished = false
 
@@ -337,7 +350,7 @@ final class CallRecorder: NSObject, SCStreamOutput, SCStreamDelegate,
                 + "interleaved=\(f.isInterleaved) buffers=\(UnsafeMutableAudioBufferListPointer(pcm.mutableAudioBufferList).count)")
         }
         farCallbacks += 1
-        noteAudio(pcm)
+        noteAudio(pcm, near: false)
 
         if farFile == nil {
             do {
@@ -434,6 +447,7 @@ final class CallRecorder: NSObject, SCStreamOutput, SCStreamDelegate,
         captureSession.commitConfiguration()
         captureSession.startRunning()
 
+        micName = device.localizedName
         log("• capturing microphone: \(device.localizedName)")
     }
 
@@ -441,7 +455,7 @@ final class CallRecorder: NSObject, SCStreamOutput, SCStreamDelegate,
                        from connection: AVCaptureConnection) {
         guard sampleBuffer.isValid, CMSampleBufferGetNumSamples(sampleBuffer) > 0,
               let pcm = Self.pcmBuffer(from: sampleBuffer) else { return }
-        noteAudio(pcm)
+        noteAudio(pcm, near: true)
 
         if nearFile == nil {
             do {
@@ -496,6 +510,8 @@ final class CallRecorder: NSObject, SCStreamOutput, SCStreamDelegate,
             "near": ["file": "near.wav", "sampleRate": nearSR, "channels": nearCh,
                      "frames": nearFrames, "seconds": Double(nearFrames) / nearSR],
             "nearOffsetSeconds": offset,
+            "mic": micName,
+            "peakDB": ["far": Self.jsonLevel(farPeakDB), "near": Self.jsonLevel(nearPeakDB)],
         ]
         if let data = try? JSONSerialization.data(withJSONObject: meta,
                                                   options: [.prettyPrinted, .sortedKeys]) {
@@ -515,6 +531,23 @@ final class CallRecorder: NSObject, SCStreamOutput, SCStreamDelegate,
         if nearFrames == 0 {
             log("warning: no microphone audio captured — check Microphone permission "
                 + "and that the right input device is selected")
+        }
+        // Frames arrived but never carried signal: the named input was not the
+        // one being spoken into. Frame counts alone could not tell this from a
+        // good recording, and a transcript with one silent side reads as if the
+        // other person simply talked the whole time.
+        if nearFrames > 0, nearPeakDB < deadChannelDB {
+            log(String(format: "warning: microphone '%@' delivered %.0fs of audio that never rose "
+                       + "above %.0f dBFS — no signal, so YOUR side is not in this recording. Check "
+                       + "that '%@' is the input the call app uses, or drop --mic / CALLCAP_MIC for "
+                       + "the system default. Run callcap-check before the next call.",
+                       micName, Double(nearFrames) / nearSR, nearPeakDB, micName))
+        }
+        if farFrames > 0, farPeakDB < deadChannelDB {
+            log(String(format: "warning: app audio delivered %.0fs that never rose above %.0f dBFS — "
+                       + "no signal, so the FAR end is not in this recording. Check the --app target "
+                       + "and Screen Recording permission.",
+                       Double(farFrames) / farSR, farPeakDB))
         }
         print(sessionDirectory.path)
     }
@@ -541,15 +574,28 @@ final class CallRecorder: NSObject, SCStreamOutput, SCStreamDelegate,
         return rms > 0 ? 20 * log10(rms) : -Float.infinity
     }
 
-    /// Called from both capture paths; resets the silence clock on real audio.
-    private func noteAudio(_ buffer: AVAudioPCMBuffer) {
+    /// Called from both capture paths; resets the silence clock on real audio
+    /// and tracks the loudest buffer per channel.
+    private func noteAudio(_ buffer: AVAudioPCMBuffer, near: Bool) {
         guard let level = Self.levelDB(buffer) else {
             lastSoundHost = Double(mach_absolute_time()) * machToSeconds
+            if near { nearPeakDB = .infinity } else { farPeakDB = .infinity }
             return
         }
+        if near { nearPeakDB = max(nearPeakDB, level) } else { farPeakDB = max(farPeakDB, level) }
         if level > soundThresholdDB {
             lastSoundHost = Double(mach_absolute_time()) * machToSeconds
         }
+    }
+
+    /// True once the microphone has delivered audio that never rose above the
+    /// dead-channel floor — an input with no signal, not a quiet speaker.
+    var micLooksDead: Bool { nearFrames > 0 && nearPeakDB < deadChannelDB }
+    var micLabel: String { micName }
+
+    /// A level for recording.json: null when it was never readable.
+    private static func jsonLevel(_ level: Float) -> Any {
+        level.isFinite ? Double((level * 10).rounded() / 10) : NSNull()
     }
 
     /// Seconds since either channel last carried audio.
@@ -983,16 +1029,25 @@ if let duration = options.duration {
     }
     log("• " + notes.joined(separator: "; "))
 
-    if options.silenceTimeout > 0 || options.maxDuration > 0 {
+    do {
         let started = Double(mach_absolute_time()) * machToSeconds
         Task {
             // Poll rather than schedule: the deadline moves every time audio
             // arrives, and a 5s granularity is far finer than the minutes-scale
             // timeouts it is enforcing.
+            var warnedDeadMic = false
             while true {
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
                 let elapsed = Double(mach_absolute_time()) * machToSeconds - started
 
+                // Early enough to restart the capture rather than discover an
+                // hour later that the named device was not the one in use.
+                if !warnedDeadMic, elapsed >= 60, await recorder.micLooksDead {
+                    warnedDeadMic = true
+                    log("\nwarning: no signal from microphone '\(await recorder.micLabel)' in the first "
+                        + "minute. If you have been talking, the call app is using a different input — "
+                        + "Ctrl-C and restart without --mic, or with the device the app uses.")
+                }
                 if options.maxDuration > 0, elapsed >= options.maxDuration {
                     log("\n• stopping: reached the \(humanDuration(options.maxDuration)) limit")
                     await recorder.stop()
