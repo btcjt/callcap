@@ -22,6 +22,22 @@ func log(_ message: String) {
     stderrHandle.write("\(message)\n".data(using: .utf8)!)
 }
 
+/// A macOS notification banner plus the alert sound. The terminal running
+/// the capture is usually behind the call window, so a warning printed there
+/// is a warning nobody sees until the call is over — which is exactly when it
+/// is useless. Best-effort: a failure to notify never affects the recording.
+func notify(_ title: String, _ body: String) {
+    let escape = { (s: String) in s.replacingOccurrences(of: "\\", with: "\\\\")
+                                    .replacingOccurrences(of: "\"", with: "\\\"") }
+    let script = "display notification \"\(escape(body))\" with title \"\(escape(title))\" sound name \"Basso\""
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    task.arguments = ["-e", script]
+    task.standardOutput = FileHandle.nullDevice
+    task.standardError = FileHandle.nullDevice
+    try? task.run()
+}
+
 func die(_ message: String, code: Int32 = 1) -> Never {
     log("error: \(message)")
     exit(code)
@@ -542,6 +558,8 @@ final class CallRecorder: NSObject, SCStreamOutput, SCStreamDelegate,
                        + "that '%@' is the input the call app uses, or drop --mic / CALLCAP_MIC for "
                        + "the system default. Run callcap-check before the next call.",
                        micName, Double(nearFrames) / nearSR, nearPeakDB, micName))
+            notify("callcap: your side was NOT recorded",
+                   "Microphone '\(micName)' carried no signal for the whole call.")
         }
         if farFrames > 0, farPeakDB < deadChannelDB {
             log(String(format: "warning: app audio delivered %.0fs that never rose above %.0f dBFS — "
@@ -1044,9 +1062,12 @@ if let duration = options.duration {
                 // hour later that the named device was not the one in use.
                 if !warnedDeadMic, elapsed >= 60, await recorder.micLooksDead {
                     warnedDeadMic = true
-                    log("\nwarning: no signal from microphone '\(await recorder.micLabel)' in the first "
+                    let mic = await recorder.micLabel
+                    log("\nwarning: no signal from microphone '\(mic)' in the first "
                         + "minute. If you have been talking, the call app is using a different input — "
                         + "Ctrl-C and restart without --mic, or with the device the app uses.")
+                    notify("callcap: your mic is silent",
+                           "No signal from '\(mic)' after 1 minute. Ctrl-C and restart without --mic.")
                 }
                 if options.maxDuration > 0, elapsed >= options.maxDuration {
                     log("\n• stopping: reached the \(humanDuration(options.maxDuration)) limit")
