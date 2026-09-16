@@ -19,8 +19,9 @@ callcap [options] — record a call, then transcribe it
   --app <app>       capture only this app, by name or bundle id — more
                     precise when you know which app owns the call
   --system          capture all system audio (the default)
-  --mic <name>      input device to record you with. Naming a non-Bluetooth
-                    mic keeps AirPods in high-quality listening mode.
+  --mic <name>      preferred input device. Naming a non-Bluetooth mic keeps
+                    AirPods in high-quality listening mode. If it carries no
+                    signal for a minute, the system default input takes over.
   --silence-timeout <min>  stop after N min with no audio (default 5, 0 off)
   --max-duration <min>     hard cap (default 180, 0 off)
   --no-auto-stop           run until Ctrl-C regardless of length or silence

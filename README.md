@@ -208,10 +208,16 @@ Most of these cost real debugging time; they are recorded so they cost it once.
   55-minute call at -63 dBFS, the frame-count warning never fired, and the
   transcript credited every word — including the echo of my own voice off the
   other party's speakers — to them, as one 4,500-word turn. Levels are now
-  tracked per channel: the recorder warns after a minute with no signal on the
-  mic (in time to restart), again at stop, `recording.json` records the device
-  and peak levels, `callcap` says which channel is silent before whisper runs,
-  and the transcript header states when a side has no speech.
+  tracked per channel. **A named `--mic` that carries no signal for the first
+  minute is swapped for the system default input automatically** (banner +
+  sound; the first minute of your side is lost, the rest is recorded;
+  `recording.json` gets `micFellBack: true`). With no `--mic` there is
+  nothing to fall back to, so it only warns. At stop it warns again if a side
+  never carried signal, `recording.json` records the device and peak levels,
+  `callcap` says which channel is silent before whisper runs, and the
+  transcript header states when a side has no speech. `--mic` therefore
+  means "prefer this device", which keeps its one real use (a wired input so
+  AirPods stay in high-quality mode) without a dead device costing a call.
 - **The far end leaks into your room mic**, so a sentence can transcribe on both
   channels. `merge_transcript.py` drops the duplicate; the heuristic is text
   identity within a 1s window, so it is conservative and lets echoes through

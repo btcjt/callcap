@@ -270,6 +270,10 @@ final class CallRecorder: NSObject, SCStreamOutput, SCStreamDelegate,
     /// lower for the whole call.
     private let deadChannelDB: Float = -55
     private var micName = "system default input"
+    private var micFellBack = false
+    /// Converts mic buffers to near.wav's format after a device switch, since
+    /// the file's format is fixed by the first buffer written to it.
+    private var nearConverter: AVAudioConverter?
 
     private let writeQueue = DispatchQueue(label: "com.callcap.write")
     private var finished = false
@@ -467,6 +471,31 @@ final class CallRecorder: NSObject, SCStreamOutput, SCStreamDelegate,
         log("• capturing microphone: \(device.localizedName)")
     }
 
+    /// Swap the microphone input to the system default. Used when a named
+    /// --mic device has produced no signal: a warning nobody sees still loses
+    /// the call, whereas the default input is almost always the one the call
+    /// app is using. Returns the new device name, or nil if nothing changed.
+    func fallbackToDefaultMic() -> String? {
+        guard let device = AVCaptureDevice.default(for: .audio),
+              device.localizedName != micName,
+              let input = try? AVCaptureDeviceInput(device: device) else { return nil }
+        captureSession.beginConfiguration()
+        for existing in captureSession.inputs { captureSession.removeInput(existing) }
+        guard captureSession.canAddInput(input) else {
+            captureSession.commitConfiguration()
+            return nil
+        }
+        captureSession.addInput(input)
+        captureSession.commitConfiguration()
+        writeQueue.sync {
+            micName = device.localizedName
+            micFellBack = true
+            nearPeakDB = -.infinity
+            nearConverter = nil
+        }
+        return device.localizedName
+    }
+
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         guard sampleBuffer.isValid, CMSampleBufferGetNumSamples(sampleBuffer) > 0,
@@ -487,11 +516,36 @@ final class CallRecorder: NSObject, SCStreamOutput, SCStreamDelegate,
             nearStartHost = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
         }
         do {
-            try nearFile?.write(from: pcm)
-            nearFrames += Int64(pcm.frameLength)
+            let out = try nearBufferMatchingFile(pcm)
+            try nearFile?.write(from: out)
+            nearFrames += Int64(out.frameLength)
         } catch {
             log("error: near.wav write failed: \(error)")
         }
+    }
+
+    /// The buffer as-is when it matches near.wav's format (the normal case),
+    /// otherwise converted — a fallback device may deliver a different rate
+    /// or channel count than the one the file was opened with.
+    private func nearBufferMatchingFile(_ pcm: AVAudioPCMBuffer) throws -> AVAudioPCMBuffer {
+        guard let file = nearFile, pcm.format != file.processingFormat else { return pcm }
+        if nearConverter == nil || nearConverter?.inputFormat != pcm.format {
+            nearConverter = AVAudioConverter(from: pcm.format, to: file.processingFormat)
+        }
+        guard let converter = nearConverter else { throw NSError(domain: "callcap", code: 1) }
+        let ratio = file.processingFormat.sampleRate / pcm.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(pcm.frameLength) * ratio) + 16
+        guard let out = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: capacity) else {
+            throw NSError(domain: "callcap", code: 2)
+        }
+        var consumed = false
+        var convError: NSError?
+        converter.convert(to: out, error: &convError) { _, status in
+            if consumed { status.pointee = .noDataNow; return nil }
+            consumed = true; status.pointee = .haveData; return pcm
+        }
+        if let convError { throw convError }
+        return out
     }
 
     // MARK: Stop
@@ -527,6 +581,7 @@ final class CallRecorder: NSObject, SCStreamOutput, SCStreamDelegate,
                      "frames": nearFrames, "seconds": Double(nearFrames) / nearSR],
             "nearOffsetSeconds": offset,
             "mic": micName,
+            "micFellBack": micFellBack,
             "peakDB": ["far": Self.jsonLevel(farPeakDB), "near": Self.jsonLevel(nearPeakDB)],
         ]
         if let data = try? JSONSerialization.data(withJSONObject: meta,
@@ -1029,9 +1084,59 @@ func humanDuration(_ seconds: Double) -> String {
     return String(format: "%.0fs", seconds)
 }
 
+/// Runs for the whole capture: swaps a dead --mic device for the default
+/// input after a minute, and enforces the max-duration / silence limits.
+func startWatchdog() {
+    let started = Double(mach_absolute_time()) * machToSeconds
+    Task {
+        // Poll rather than schedule: the deadline moves every time audio
+        // arrives, and a 5s granularity is far finer than the minutes-scale
+        // timeouts it is enforcing.
+        var warnedDeadMic = false
+        while true {
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            let elapsed = Double(mach_absolute_time()) * machToSeconds - started
+
+            // Early enough to restart the capture rather than discover an
+            // hour later that the named device was not the one in use.
+            if !warnedDeadMic, elapsed >= 60, await recorder.micLooksDead {
+                warnedDeadMic = true
+                let mic = await recorder.micLabel
+                if options.micDeviceName != nil, let switched = await recorder.fallbackToDefaultMic() {
+                    log("\nwarning: no signal from microphone '\(mic)' in the first minute — "
+                        + "switched to the system default input '\(switched)'. The first minute of "
+                        + "your side is lost; the rest is recorded.")
+                    notify("callcap: switched mic",
+                           "'\(mic)' had no signal. Now recording you from '\(switched)'.")
+                } else {
+                    log("\nwarning: no signal from microphone '\(mic)' in the first "
+                        + "minute. If you have been talking, the call app is using a different input — "
+                        + "Ctrl-C and restart with the device the app uses.")
+                    notify("callcap: your mic is silent",
+                           "No signal from '\(mic)' after 1 minute. Ctrl-C and restart.")
+                }
+            }
+            if options.maxDuration > 0, elapsed >= options.maxDuration {
+                log("\n• stopping: reached the \(humanDuration(options.maxDuration)) limit")
+                await recorder.stop()
+                gate.open()
+                return
+            }
+            if options.silenceTimeout > 0, await recorder.silentFor >= options.silenceTimeout {
+                log("\n• stopping: \(humanDuration(options.silenceTimeout)) with no audio "
+                    + "on either channel")
+                await recorder.stop()
+                gate.open()
+                return
+            }
+        }
+    }
+}
+
 if let duration = options.duration {
     // Fixed-length capture, used by the smoke test.
     log(String(format: "• recording for %.0fs (Ctrl-C stops early)", duration))
+    startWatchdog()
     Task {
         try? await Task.sleep(nanoseconds: UInt64(duration * 1_000_000_000))
         await recorder.stop()
@@ -1047,44 +1152,7 @@ if let duration = options.duration {
     }
     log("• " + notes.joined(separator: "; "))
 
-    do {
-        let started = Double(mach_absolute_time()) * machToSeconds
-        Task {
-            // Poll rather than schedule: the deadline moves every time audio
-            // arrives, and a 5s granularity is far finer than the minutes-scale
-            // timeouts it is enforcing.
-            var warnedDeadMic = false
-            while true {
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
-                let elapsed = Double(mach_absolute_time()) * machToSeconds - started
-
-                // Early enough to restart the capture rather than discover an
-                // hour later that the named device was not the one in use.
-                if !warnedDeadMic, elapsed >= 60, await recorder.micLooksDead {
-                    warnedDeadMic = true
-                    let mic = await recorder.micLabel
-                    log("\nwarning: no signal from microphone '\(mic)' in the first "
-                        + "minute. If you have been talking, the call app is using a different input — "
-                        + "Ctrl-C and restart without --mic, or with the device the app uses.")
-                    notify("callcap: your mic is silent",
-                           "No signal from '\(mic)' after 1 minute. Ctrl-C and restart without --mic.")
-                }
-                if options.maxDuration > 0, elapsed >= options.maxDuration {
-                    log("\n• stopping: reached the \(humanDuration(options.maxDuration)) limit")
-                    await recorder.stop()
-                    gate.open()
-                    return
-                }
-                if options.silenceTimeout > 0, await recorder.silentFor >= options.silenceTimeout {
-                    log("\n• stopping: \(humanDuration(options.silenceTimeout)) with no audio "
-                        + "on either channel")
-                    await recorder.stop()
-                    gate.open()
-                    return
-                }
-            }
-        }
-    }
+    startWatchdog()
 }
 
 await gate.wait()
